@@ -1,7 +1,4 @@
 #!/bin/bash
-# uninstaller.sh - Removes all traces of Zipline from the server
-
-set -e
 
 # Function to handle errors
 handle_error() {
@@ -9,80 +6,89 @@ handle_error() {
     exit 1
 }
 
-echo "Starting Zipline uninstallation..."
+# Function to log messages
+log_message() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1"
+}
 
-# 1. Stop and disable the systemd service
-SERVICE_NAME="zipline"
-echo "Stopping Zipline service..."
-if systemctl is-active --quiet "$SERVICE_NAME"; then
-    systemctl stop "$SERVICE_NAME" || handle_error "Failed to stop Zipline service"
-fi
-
-echo "Disabling Zipline service..."
-systemctl disable "$SERVICE_NAME" || echo "Service may already be disabled."
-
-# 2. Remove the systemd service file
-SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
-if [ -f "$SERVICE_FILE" ]; then
-    rm -f "$SERVICE_FILE" || handle_error "Failed to remove service file $SERVICE_FILE"
-    echo "Removed systemd service file: $SERVICE_FILE"
-fi
-
-# Reload systemd daemon to pick up the changes
-systemctl daemon-reload || echo "Warning: Failed to reload systemd daemon."
-systemctl reset-failed || echo "Warning: Failed to reset systemd failed state."
-
-# 3. Remove the installation directory
+# Variables
 INSTALL_DIR="/usr/local/zipline"
-if [ -d "$INSTALL_DIR" ]; then
-    rm -rf "$INSTALL_DIR" || handle_error "Failed to remove installation directory $INSTALL_DIR"
-    echo "Removed installation directory: $INSTALL_DIR"
+SERVICE_NAME="zipline"
+LOG_FILE="/var/log/zipline-backup.log"
+
+# Check if running as root
+if [[ $EUID -ne 0 ]]; then
+   handle_error "This script must be run as root"
 fi
 
-# 4. Remove firewall rules for port 2000 (if present)
-PORT=2000
+log_message "Starting Zipline uninstallation..."
 
-# For iptables
+# Stop and disable the service
+log_message "Stopping and disabling Zipline service..."
+systemctl stop "$SERVICE_NAME" 2>/dev/null
+systemctl disable "$SERVICE_NAME" 2>/dev/null
+log_message "Service stopped and disabled"
+
+# Remove service file
+if [ -f "/etc/systemd/system/$SERVICE_NAME.service" ]; then
+    log_message "Removing service file..."
+    rm -f "/etc/systemd/system/$SERVICE_NAME.service"
+    systemctl daemon-reload
+    log_message "Service file removed"
+fi
+
+# Remove firewall rules
+log_message "Removing firewall rules..."
+
+# Remove from iptables
 if command -v iptables >/dev/null 2>&1; then
-    echo "Removing iptables rule for TCP port $PORT (if exists)..."
-    iptables -D INPUT -p tcp --dport $PORT -j ACCEPT 2>/dev/null || echo "iptables rule not found or already removed."
+    log_message "Removing iptables rule..."
+    iptables -D INPUT -p tcp --dport 2000 -j ACCEPT 2>/dev/null
     
-    # Save changes (RedHat/CentOS)
+    # Save iptables rules
     if [ -f /etc/redhat-release ]; then
-        service iptables save || echo "Warning: Failed to save iptables rules."
-    # Save changes (Debian/Ubuntu)
+        service iptables save 2>/dev/null
     elif [ -f /etc/debian_version ]; then
-        iptables-save > /etc/iptables/rules.v4 || echo "Warning: Failed to save iptables rules."
+        iptables-save > /etc/iptables/rules.v4 2>/dev/null
     fi
 fi
 
-# For firewalld
+# Remove from firewalld
 if command -v firewall-cmd >/dev/null 2>&1; then
-    echo "Removing firewalld rule for TCP port $PORT (if exists)..."
-    firewall-cmd --permanent --remove-port=${PORT}/tcp || echo "firewalld rule not found or already removed."
-    firewall-cmd --reload || echo "Warning: Failed to reload firewalld."
+    log_message "Removing firewalld rule..."
+    firewall-cmd --permanent --remove-port=2000/tcp 2>/dev/null
+    firewall-cmd --reload 2>/dev/null
 fi
 
-# For UFW
+# Remove from UFW
 if command -v ufw >/dev/null 2>&1; then
-    echo "Removing UFW rule for TCP port $PORT (if exists)..."
-    ufw delete allow ${PORT}/tcp || echo "ufw rule not found or already removed."
-    ufw reload || echo "Warning: Failed to reload UFW."
+    log_message "Removing UFW rule..."
+    ufw delete allow 2000/tcp 2>/dev/null
+    ufw reload 2>/dev/null
 fi
 
-# 5. Remove any log files created by Zipline (optional)
-LOG_FILE1="/var/log/zipline-backup.log"
-LOG_FILE2="/var/log/wp_db_import.log"
-
-if [ -f "$LOG_FILE1" ]; then
-    echo "Removing log file: $LOG_FILE1"
-    rm -f "$LOG_FILE1" || echo "Warning: Failed to remove $LOG_FILE1"
+# Remove installation directory
+if [ -d "$INSTALL_DIR" ]; then
+    log_message "Removing installation directory..."
+    rm -rf "$INSTALL_DIR"
+    log_message "Installation directory removed"
 fi
 
-if [ -f "$LOG_FILE2" ]; then
-    echo "Removing log file: $LOG_FILE2"
-    rm -f "$LOG_FILE2" || echo "Warning: Failed to remove $LOG_FILE2"
+# Remove log file
+if [ -f "$LOG_FILE" ]; then
+    log_message "Removing log file..."
+    rm -f "$LOG_FILE"
+    log_message "Log file removed"
 fi
 
-echo "Zipline has been successfully uninstalled from the server."
-exit 0
+# Final cleanup
+log_message "Performing final cleanup..."
+
+# Remove any leftover temporary files
+rm -rf /tmp/zipline_* 2>/dev/null
+
+# Reload systemd one final time
+systemctl daemon-reload
+
+log_message "Uninstallation completed successfully"
+echo "Zipline has been completely uninstalled from the system."

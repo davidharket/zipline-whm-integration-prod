@@ -13,13 +13,10 @@ configure_firewall() {
     # Check for iptables
     if command -v iptables >/dev/null 2>&1; then
         echo "Found iptables, configuring..."
-
         # Remove existing rule if it exists
         iptables -D INPUT -p tcp --dport 2000 -j ACCEPT 2>/dev/null
-
         # Find the position of the REJECT or DROP rule if it exists
         REJECT_LINE=$(iptables -L INPUT --line-numbers | grep -E 'REJECT|DROP' | head -n1 | awk '{print $1}')
-
         if [ -n "$REJECT_LINE" ]; then
             # Insert before the REJECT/DROP rule
             iptables -I INPUT "$REJECT_LINE" -p tcp --dport 2000 -j ACCEPT
@@ -27,7 +24,6 @@ configure_firewall() {
             # If no REJECT/DROP rule, append to the end
             iptables -A INPUT -p tcp --dport 2000 -j ACCEPT
         fi
-
         # Save iptables rules
         if [ -f /etc/redhat-release ]; then
             service iptables save
@@ -58,10 +54,10 @@ INSTALL_DIR="/usr/local/zipline"
 SERVICE_NAME="zipline"
 
 # Create necessary directories
-mkdir -p $INSTALL_DIR || handle_error "Failed to create installation directory"
+mkdir -p "$INSTALL_DIR" || handle_error "Failed to create installation directory"
 
 # Create the main router script
-cat > $INSTALL_DIR/zipline-router.php << 'EOL'
+cat > "$INSTALL_DIR/zipline-router.php" << 'EOL'
 <?php
 if ($_SERVER['REQUEST_URI'] === '/backup') {
     require __DIR__ . '/zipline-backup.php';
@@ -70,422 +66,551 @@ if ($_SERVER['REQUEST_URI'] === '/backup') {
     require __DIR__ . '/zipline-server.php';
     exit;
 }
+?>
 EOL
 
-# Create the backup receiver endpoint
-cat > $INSTALL_DIR/zipline-backup.php << 'EOL'
+# Create the backup receiver endpoint (zipline-backup.php)
+cat > "$INSTALL_DIR/zipline-backup.php" << 'EOL'
 <?php
 /**
  * zipline-backup.php
  *
- * This endpoint is part of the Zipline migration process. It receives a backup ZIP archive
- * (via a POST request with multipart/form-data) along with a target domain and an optional
- * admin email. It will:
- *   - Determine the cPanel account owner for the domain (via /etc/trueuserdomains)
- *   - Determine the document root (/home/{owner}/public_html)
- *   - Extract the backup archive into a temporary folder
- *   - Replace the current wp-content directory with the backup version
- *   - Update wp-config.php and .htaccess if provided in the backup
- *   - Import the database dump file (matching database_backup_*.sql)
- *   - Optionally process metadata.json (if present)
- *   - Set proper file/directory permissions and ownership for the migrated files
- *   - Clean up temporary files and respond with a JSON result.
+ * This endpoint handles WordPress backup restoration with cPanel integration.
+ * It now uses a command-line WHM API approach to update MySQL credentials.
+ *
+ * The new approach extracts the original database credentials from wp-config.php,
+ * removes any existing prefix, and then applies the cPanel account's prefix.
+ * If the resulting database or user already exists, new randomized names (and user password)
+ * are generated.
  */
 
-// Enable error logging
+// Error configuration
+ini_set('display_errors', 0);
 ini_set('log_errors', 1);
 ini_set('error_log', '/var/log/zipline-backup.log');
 
 /**
- * Log messages to the error log.
- *
- * @param string $message
- * @param mixed  $data Optional additional data to log.
+ * Log a message.
  */
 function ziplog($message, $data = null) {
     $logMessage = "[" . date('Y-m-d H:i:s') . "] " . $message;
     if ($data !== null) {
-        if (is_array($data) || is_object($data)) {
-            $logMessage .= "\n" . print_r($data, true);
-        } else {
-            $logMessage .= " " . $data;
-        }
+        $logMessage .= "\n" . print_r($data, true);
     }
     error_log($logMessage);
 }
 
 /**
- * Send a JSON response and exit.
- *
- * @param string $status  'success' or 'error'
- * @param string $message Response message.
- * @param array  $data    Additional data to include.
+ * Return a JSON response and exit.
  */
 function respond($status, $message, $data = []) {
-    ziplog("Response: Status=$status, Message=$message", $data);
+    ziplog("Response: $status - $message", $data);
     header('Content-Type: application/json');
-    echo json_encode(['status' => $status, 'message' => $message, 'data' => $data]);
-    exit;
+    exit(json_encode(['status' => $status, 'message' => $message, 'data' => $data]));
 }
 
 /**
- * Recursively copy files and directories from source to destination.
+ * Executes a WHM API 1 call using the whmapi1 command.
  *
- * @param string $src Source directory.
- * @param string $dst Destination directory.
+ * @param string $function The WHM API function.
+ * @param array  $params   Associative array of parameters.
+ * @return array|null Decoded JSON response or null on error.
  */
-function recursiveCopy($src, $dst) {
-    ziplog("Starting recursive copy", ['from' => $src, 'to' => $dst]);
-
-    if (!file_exists($src)) {
-        ziplog("Source does not exist: " . $src);
-        return;
+function make_whm_api_call($function, $params) {
+    // Note: $cpanel_username and $module would be defined in context if needed.
+    // For this sample, we assume that WHM API calls (if used) are not needed.
+    $command = "sudo /usr/local/cpanel/bin/whmapi --output=json " . escapeshellarg($function);
+    foreach ($params as $key => $value) {
+        $command .= " " . escapeshellarg($key) . "=" . escapeshellarg($value);
     }
+    ziplog("Executing WHM API call: $command");
+    exec($command . " 2>&1", $output, $return_var);
+    $result = implode("\n", $output);
+    ziplog("WHM API call return code: $return_var");
+    ziplog("WHM API result: " . $result);
 
-    if (!file_exists($dst)) {
-        mkdir($dst, 0755, true);
+    if ($return_var !== 0) {
+        ziplog("WHM API call failed with return code: $return_var", true);
+        return null;
     }
+    $decoded_result = json_decode($result, true);
+    if (json_last_error() !== JSON_ERROR_NONE) {
+        ziplog("JSON decode error: " . json_last_error_msg(), true);
+        ziplog("Full WHM API output: " . $result, true);
+        return null;
+    }
+    return $decoded_result;
+}
 
-    $files = scandir($src);
-    foreach ($files as $file) {
-        if ($file == '.' || $file == '..') {
-            continue;
-        }
-        $srcFile = $src . '/' . $file;
-        $dstFile = $dst . '/' . $file;
+/**
+ * Executes a cPanel UAPI call using the uapi command for a specific account.
+ *
+ * @param string $cpanel_username The cPanel username.
+ * @param string $module          The UAPI module (e.g., 'Mysql').
+ * @param string $function        The UAPI function (e.g., 'create_database').
+ * @param array  $params          Associative array of parameters.
+ *
+ * @return array|null Decoded JSON response or null on error.
+ */
+function make_uapi_call($cpanel_username, $module, $function, $params) {
+    $command = "sudo /usr/local/cpanel/bin/uapi --user=" . escapeshellarg($cpanel_username)
+        . " " . escapeshellarg($module) . " " . escapeshellarg($function);
+    foreach ($params as $key => $value) {
+        $command .= " " . escapeshellarg($key) . "=" . escapeshellarg($value);
+    }
+    $command .= " --output=json";
 
-        if (is_dir($srcFile)) {
-            recursiveCopy($srcFile, $dstFile);
-        } else {
-            if (!copy($srcFile, $dstFile)) {
-                ziplog("Failed to copy file", ['file' => $file, 'error' => error_get_last()]);
+    ziplog("Executing UAPI call: $command");
+    exec($command . " 2>&1", $output, $return_var);
+    $result = implode("\n", $output);
+    ziplog("UAPI call return code: $return_var");
+    ziplog("UAPI result: " . $result);
+
+    if ($return_var !== 0) {
+        ziplog("UAPI call failed with return code: $return_var", true);
+        return null;
+    }
+    $decoded_result = json_decode($result, true);
+    if (json_last_error() !== JSON_ERROR_NONE) {
+        ziplog("JSON decode error: " . json_last_error_msg(), true);
+        ziplog("Full UAPI output: " . $result, true);
+        return null;
+    }
+    return $decoded_result;
+}
+
+/**
+ * Check if a database already exists.
+ */
+function check_database_exists($cpanel_username, $dbName) {
+    $result = make_uapi_call($cpanel_username, 'Mysql', 'list_databases', []);
+    if ($result && isset($result['result']['data']) && is_array($result['result']['data'])) {
+        foreach ($result['result']['data'] as $db) {
+            // Depending on the API version, the key holding the db name may vary.
+            if (isset($db['name']) && $db['name'] === $dbName) {
+                return true;
             }
         }
     }
-    ziplog("Completed recursive copy", ['from' => $src, 'to' => $dst]);
+    return false;
 }
 
 /**
- * Recursively set ownership and permissions for a given path.
- *
- * @param string $path  File or directory path.
- * @param string $owner Owner username.
+ * Check if a MySQL user already exists.
  */
-function setOwnershipAndPermissions($path, $owner) {
-    ziplog("Setting ownership/permissions", ['path' => $path, 'owner' => $owner]);
+function check_user_exists($cpanel_username, $dbUser) {
+    $result = make_uapi_call($cpanel_username, 'Mysql', 'list_users', []);
+    if ($result && isset($result['result']['data']) && is_array($result['result']['data'])) {
+        foreach ($result['result']['data'] as $user) {
+            // Depending on the API output, adjust the key name accordingly.
+            if (isset($user['user']) && $user['user'] === $dbUser) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
 
-    if (is_dir($path)) {
-        chmod($path, 0755);
-        chown($path, $owner);
-        chgrp($path, $owner);
-        $items = scandir($path);
-        foreach ($items as $item) {
-            if ($item == '.' || $item == '..') {
+/**
+ * Generate a random string of specified length.
+ */
+function generateRandomString($length = 8) {
+    // Using random_bytes if available.
+    return substr(bin2hex(random_bytes((int)ceil($length/2))), 0, $length);
+}
+
+/**
+ * Generate a strong random string of specified length.
+ * Uses upper-case, lower-case, digits, and symbols.
+ *
+ * @param int $length The desired length.
+ * @return string The generated password.
+ */
+function generateStrongRandomString($length = 16) {
+    $chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789!@#$%^&*()-_=+[]{}|;:,.<>?';
+    $charLen = strlen($chars);
+    $result = '';
+    for ($i = 0; $i < $length; $i++) {
+        $index = random_int(0, $charLen - 1);
+        $result .= $chars[$index];
+    }
+    return $result;
+}
+
+/**
+ * Update MySQL credentials by creating a new database and user,
+ * then granting privileges to the new user.
+ *
+ * If the computed (prefixed) names already exist—or if creation fails because of a collision
+ * or weak password—the function generates new random credentials and retries.
+ *
+ * @param string $cpanel_username The cPanel username.
+ * @param string $old_db_name     The original database name (for reference).
+ * @param string $base_db_name    The original (unprefixed) database name from wp-config.
+ * @param string $old_db_user     The original database user (for reference).
+ * @param string $base_db_user    The original (unprefixed) user name from wp-config.
+ * @param string $old_password    The original database password.
+ * @return array Returns an associative array with keys 'success', 'message', and the new credentials.
+ */
+function update_mysql_credentials($cpanel_username, $old_db_name, $base_db_name, $old_db_user, $base_db_user, $old_password) {
+    ziplog("Updating MySQL credentials for user: $cpanel_username");
+
+    $maxRetries = 3;
+    $attempt = 0;
+    $success = false;
+
+    // Start with the default new names; use the old password by default.
+    $new_db_name = $cpanel_username . '_' . $base_db_name;
+    $new_db_user = $cpanel_username . '_' . $base_db_user;
+    $new_password = $old_password;
+
+    while ($attempt < $maxRetries && !$success) {
+        ziplog("Attempt " . ($attempt + 1) . ": Trying new DB Name: $new_db_name, new DB User: $new_db_user");
+
+        // Try to create the database using UAPI
+        $create_db_result = make_uapi_call($cpanel_username, 'Mysql', 'create_database', [
+            'name' => $new_db_name
+        ]);
+        if ($create_db_result !== null && isset($create_db_result['result']['status']) && $create_db_result['result']['status'] == 1) {
+            ziplog("Database created successfully");
+        } else {
+            // Check if error indicates database already exists
+            $errors = isset($create_db_result['result']['errors']) ? $create_db_result['result']['errors'] : [];
+            if (is_array($errors) && count($errors) > 0 && strpos($errors[0], 'already exists') !== false) {
+                ziplog("Database '$new_db_name' already exists. Generating new random credentials.");
+                // Generate new random suffix and password.
+                $randomSuffix = generateRandomString(6);
+                $new_db_name = $cpanel_username . '_' . $base_db_name . '_' . $randomSuffix;
+                $new_db_user = $cpanel_username . '_' . $base_db_user . '_' . $randomSuffix;
+                $new_password = generateStrongRandomString(16);
+                $attempt++;
+                continue;
+            } else {
+                ziplog("Failed to create database: " . json_encode($create_db_result), true);
+                return ['success' => false, 'message' => 'Failed to create database'];
+            }
+        }
+
+        // Create database user using UAPI
+        $create_user_result = make_uapi_call($cpanel_username, 'Mysql', 'create_user', [
+            'name'     => $new_db_user,
+            'password' => $new_password
+        ]);
+        if ($create_user_result === null || !isset($create_user_result['result']['status']) || $create_user_result['result']['status'] != 1) {
+            $errors = isset($create_user_result['result']['errors']) ? $create_user_result['result']['errors'] : [];
+            if (is_array($errors) && count($errors) > 0) {
+                if (strpos($errors[0], 'already exists') !== false) {
+                    ziplog("User '$new_db_user' already exists. Generating new random credentials.");
+                } elseif (strpos($errors[0], 'too weak') !== false) {
+                    ziplog("The given password is too weak. Generating new strong random credentials.");
+                } else {
+                    ziplog("Failed to create database user: " . json_encode($create_user_result), true);
+                    return ['success' => false, 'message' => 'Failed to create database user'];
+                }
+                // Generate new random suffix and a strong password.
+                $randomSuffix = generateRandomString(6);
+                $new_db_name = $cpanel_username . '_' . $base_db_name . '_' . $randomSuffix;
+                $new_db_user = $cpanel_username . '_' . $base_db_user . '_' . $randomSuffix;
+                $new_password = generateStrongRandomString(16);
+                $attempt++;
                 continue;
             }
-            setOwnershipAndPermissions($path . '/' . $item, $owner);
         }
-    } else {
-        chmod($path, 0644);
-        chown($path, $owner);
-        chgrp($path, $owner);
+        ziplog("Database user created successfully");
+
+        // Grant privileges using UAPI
+        $set_privileges_result = make_uapi_call($cpanel_username, 'Mysql', 'set_privileges_on_database', [
+            'user'       => $new_db_user,
+            'database'   => $new_db_name,
+            'privileges' => 'ALL PRIVILEGES'
+        ]);
+        if ($set_privileges_result === null || !isset($set_privileges_result['result']['status']) || $set_privileges_result['result']['status'] != 1) {
+            ziplog("Failed to set privileges on database: " . json_encode($set_privileges_result), true);
+            return ['success' => false, 'message' => 'Failed to set privileges on database'];
+        }
+        ziplog("Privileges set on database successfully");
+
+        // If we reach this point, everything succeeded.
+        $success = true;
+    }
+
+    if (!$success) {
+        return ['success' => false, 'message' => 'Exceeded maximum retries for database/user creation'];
+    }
+
+    return [
+        'success'    => true,
+        'message'    => 'MySQL credentials updated successfully',
+        'dbName'     => $new_db_name,
+        'dbUser'     => $new_db_user,
+        'dbPassword' => $new_password
+    ];
+}
+
+/**
+ * Get proper prefixed database names for cPanel.
+ *
+ * This function removes any existing prefix from the original names
+ * and returns an array with the unprefixed base names.
+ */
+function getBaseDbNames($owner, $dbName, $dbUser) {
+    // Remove any prefix matching "owner_" from the original names
+    $pattern = '/^' . preg_quote($owner . '_', '/') . '/';
+    $baseDbName = preg_replace($pattern, '', $dbName);
+    $baseDbUser = preg_replace($pattern, '', $dbUser);
+    return [
+        'baseDbName' => $baseDbName,
+        'baseDbUser' => $baseDbUser
+    ];
+}
+
+/**
+ * Recursively copy files from source to destination.
+ */
+function recursiveCopy($src, $dst) {
+    if (!file_exists($src)) return;
+    $dir = opendir($src);
+    @mkdir($dst, 0755);
+    while (($file = readdir($dir)) !== false) {
+        if ($file == '.' || $file == '..') continue;
+        $srcFile = "$src/$file";
+        $dstFile = "$dst/$file";
+        is_dir($srcFile) ? recursiveCopy($srcFile, $dstFile) : copy($srcFile, $dstFile);
+    }
+    closedir($dir);
+}
+
+/**
+ * Extract database credentials from wp-config.php.
+ */
+function extractDbCredentials($wpConfigPath) {
+    $content = file_get_contents($wpConfigPath);
+    if ($content === false) {
+        throw new Exception("Failed to read wp-config.php");
+    }
+    $required = ['DB_NAME', 'DB_USER', 'DB_PASSWORD', 'DB_HOST'];
+    $creds = [];
+    foreach ($required as $key) {
+        if (!preg_match("/define\(\s*'$key'\s*,\s*'([^']+)'/", $content, $match)) {
+            throw new Exception("Could not find $key in wp-config.php");
+        }
+        $creds[$key] = $match[1];
+    }
+    return $creds;
+}
+
+/**
+ * Update wp-config.php with new database credentials.
+ */
+function updateWpConfig($wpConfigPath, $newCreds) {
+    $content = file_get_contents($wpConfigPath);
+    if ($content === false) {
+        throw new Exception("Failed to read wp-config.php for updating");
+    }
+    foreach ($newCreds as $key => $value) {
+        $content = preg_replace(
+            "/define\(\s*'$key'\s*,\s*'[^']*'\s*\);/",
+            "define('$key', '$value');",
+            $content
+        );
+    }
+    if (file_put_contents($wpConfigPath, $content) === false) {
+        throw new Exception("Failed to update wp-config.php");
     }
 }
 
 /**
- * Recursively remove a directory.
- *
- * @param string $dir Directory to remove.
+ * Utility function: recursively remove a directory.
  */
 function rrmdir($dir) {
-    if (is_dir($dir)) {
-        $objects = scandir($dir);
-        foreach ($objects as $object) {
-            if ($object != "." && $object != "..") {
-                $path = $dir . "/" . $object;
-                if (is_dir($path)) {
-                    rrmdir($path);
-                } else {
-                    unlink($path);
-                }
-            }
-        }
-        rmdir($dir);
+    if (!is_dir($dir)) return;
+    foreach (scandir($dir) as $file) {
+        if ($file == '.' || $file == '..') continue;
+        $path = "$dir/$file";
+        is_dir($path) ? rrmdir($path) : unlink($path);
     }
+    rmdir($dir);
 }
 
-/**
- * Import a database dump found in the backup.
- *
- * Searches for a file matching database_backup_*.sql in the temporary extraction directory.
- *
- * @param string $tempDir The temporary directory where the backup was extracted.
- * @param string $docRoot The document root of the target site.
- */
-function importDatabaseDump($tempDir, $docRoot) {
-    ziplog("Starting database import check");
-    $dbDumpFiles = glob($tempDir . '/database_backup_*.sql');
-    if (!$dbDumpFiles || count($dbDumpFiles) === 0) {
-        ziplog("No database dump found matching pattern database_backup_*.sql");
-        return;
-    }
-    // If multiple dump files exist, pick the first one found.
-    $dbDumpFile = $dbDumpFiles[0];
-    ziplog("Found database dump file: " . $dbDumpFile);
-
-    $wpConfigPath = $docRoot . '/wp-config.php';
-    if (!file_exists($wpConfigPath)) {
-        ziplog("wp-config.php not found at: " . $wpConfigPath);
-        respond('error', 'Cannot import database: wp-config.php not found.');
+// Main Processing
+try {
+    // Validate request method
+    if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
+        respond('error', 'Invalid request method');
     }
 
-    ziplog("Reading wp-config.php for database credentials");
-    $configContents = file_get_contents($wpConfigPath);
-    $dbName = $dbUser = $dbPass = $dbHost = null;
-    if (preg_match("/define\(\s*'DB_NAME'\s*,\s*'([^']+)'/", $configContents, $matches)) {
-        $dbName = $matches[1];
-        ziplog("Found DB_NAME: " . $dbName);
-    }
-    if (preg_match("/define\(\s*'DB_USER'\s*,\s*'([^']+)'/", $configContents, $matches)) {
-        $dbUser = $matches[1];
-        ziplog("Found DB_USER: " . $dbUser);
-    }
-    if (preg_match("/define\(\s*'DB_PASSWORD'\s*,\s*'([^']+)'/", $configContents, $matches)) {
-        $dbPass = $matches[1];
-        ziplog("Found DB_PASSWORD: [hidden]");
-    }
-    if (preg_match("/define\(\s*'DB_HOST'\s*,\s*'([^']+)'/", $configContents, $matches)) {
-        $dbHost = $matches[1];
-        ziplog("Found DB_HOST: " . $dbHost);
+    // Validate inputs
+    if (!isset($_FILES['backup']) || !isset($_POST['domain'])) {
+        respond('error', 'Missing required fields');
     }
 
-    if (!$dbName || !$dbUser || $dbPass === null || !$dbHost) {
-        ziplog("Failed to parse database credentials", [
-            'name_found' => !empty($dbName),
-            'user_found' => !empty($dbUser),
-            'pass_found' => ($dbPass !== null),
-            'host_found' => !empty($dbHost)
-        ]);
-        respond('error', 'Failed to parse database credentials from wp-config.php.');
-    }
-
-    ziplog("Preparing to import database dump");
-    $cmd = "mysql -h " . escapeshellarg($dbHost) . " -u " . escapeshellarg($dbUser) .
-           " -p" . escapeshellarg($dbPass) . " " . escapeshellarg($dbName) .
-           " < " . escapeshellarg($dbDumpFile);
-    ziplog("Executing mysql import command: " . $cmd);
-    $output = shell_exec($cmd . " 2>&1");
-    ziplog("Database import completed with output", ['output' => $output]);
-    file_put_contents("/var/log/wp_db_import.log", "Database import output: " . $output . "\n", FILE_APPEND);
-}
-
-// ---------------------------------------------------------------------
-// Main Processing Logic
-// ---------------------------------------------------------------------
-
-// Only accept POST requests
-if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
-    ziplog("Invalid request method: " . $_SERVER['REQUEST_METHOD']);
-    respond('error', 'Invalid request method.');
-}
-
-// Log the request details
-ziplog("Received backup request", [
-    'REQUEST_METHOD' => $_SERVER['REQUEST_METHOD'],
-    'FILES' => $_FILES,
-    'POST' => $_POST
-]);
-
-// Validate required inputs: backup file and domain
-if (!isset($_FILES['backup']) || !isset($_POST['domain'])) {
-    ziplog("Missing required fields", [
-        'files_set'  => isset($_FILES['backup']),
-        'domain_set' => isset($_POST['domain'])
-    ]);
-    respond('error', 'Missing required fields: backup file and domain.');
-}
-
-$domain = trim($_POST['domain']);
-$backupFile = $_FILES['backup'];
-$adminEmail = isset($_POST['adminEmail']) ? trim($_POST['adminEmail']) : '';
-
-ziplog("Processing request", [
-    'domain'       => $domain,
-    'backup_file'  => $backupFile['name'],
-    'admin_email'  => $adminEmail
-]);
-
-if ($backupFile['error'] !== UPLOAD_ERR_OK) {
-    ziplog("File upload error", [
-        'error_code' => $backupFile['error'],
-        'file_info'  => $backupFile
-    ]);
-    respond('error', 'File upload error: ' . $backupFile['error']);
-}
-
-// Save the uploaded ZIP archive to a temporary file
-$tempFile = sys_get_temp_dir() . '/' . basename($backupFile['name']);
-ziplog("Moving uploaded file", [
-    'from' => $backupFile['tmp_name'],
-    'to'   => $tempFile
-]);
-
-if (!move_uploaded_file($backupFile['tmp_name'], $tempFile)) {
-    ziplog("Failed to move uploaded file", ['error' => error_get_last()]);
-    respond('error', 'Failed to move uploaded file.');
-}
-
-// Lookup domain owner using /etc/trueuserdomains
-$trueUserDomainsFile = '/etc/trueuserdomains';
-ziplog("Looking up domain owner in: " . $trueUserDomainsFile);
-
-if (!file_exists($trueUserDomainsFile)) {
-    ziplog("Domain mapping file not found");
-    respond('error', 'Unable to locate user domain mapping file.');
-}
-
-$owner = null;
-$lines = file($trueUserDomainsFile, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
-ziplog("Found " . count($lines) . " domain mappings");
-
-foreach ($lines as $line) {
-    $parts = explode(':', $line);
-    if (count($parts) >= 2) {
-        $mappedDomain = trim($parts[0]);
-        $username     = trim($parts[1]);
-        ziplog("Checking domain mapping", [
-            'mapped_domain' => $mappedDomain,
-            'username'      => $username,
-            'target_domain' => $domain
-        ]);
-        if (strcasecmp($mappedDomain, $domain) === 0) {
-            $owner = $username;
-            ziplog("Found matching owner: " . $owner);
+    // Process domain ownership
+    $domain = trim($_POST['domain']);
+    $owner = null;
+    foreach (file('/etc/trueuserdomains', FILE_IGNORE_NEW_LINES) as $line) {
+        list($mappedDomain, $user) = explode(':', $line);
+        if (strcasecmp(trim($mappedDomain), $domain) === 0) {
+            $owner = trim($user);
             break;
         }
     }
-}
-
-if (!$owner) {
-    ziplog("No owner found for domain: " . $domain);
-    respond('error', 'No matching user found for domain.');
-}
-
-// Set the document root based on the owner
-$docRoot = "/home/{$owner}/public_html";
-ziplog("Document root set to: " . $docRoot);
-
-// Create a temporary directory for extraction
-$tempDir = sys_get_temp_dir() . '/backup_' . time();
-ziplog("Creating temporary directory: " . $tempDir);
-if (!mkdir($tempDir, 0755, true)) {
-    ziplog("Failed to create temp directory", ['error' => error_get_last()]);
-    respond('error', 'Failed to create temporary extraction directory.');
-}
-
-// Extract the ZIP archive
-ziplog("Opening ZIP archive: " . $tempFile);
-$zip = new ZipArchive();
-$zipResult = $zip->open($tempFile);
-if ($zipResult === TRUE) {
-    ziplog("ZIP file opened successfully, contains " . $zip->numFiles . " files");
-    for ($i = 0; $i < $zip->numFiles; $i++) {
-        ziplog("ZIP contains: " . $zip->getNameIndex($i));
+    if (!$owner) {
+        respond('error', 'Domain owner not found');
     }
-    ziplog("Extracting to: " . $tempDir);
-    if (!$zip->extractTo($tempDir)) {
-        ziplog("Failed to extract ZIP", ['error' => error_get_last()]);
-        respond('error', 'Failed to extract ZIP archive.');
+
+    // Setup paths
+    $docRoot = "/home/$owner/public_html";
+    if (!is_dir($docRoot)) {
+        respond('error', 'Document root not found');
     }
+
+    // Create and validate temp directory
+    $tempDir = sys_get_temp_dir() . '/zipline_' . bin2hex(random_bytes(8));
+    if (!mkdir($tempDir, 0755, true)) {
+        respond('error', 'Failed to create temp directory');
+    }
+
+    // Extract backup archive
+    $zip = new ZipArchive;
+    if ($zip->open($_FILES['backup']['tmp_name']) !== TRUE) {
+        rrmdir($tempDir);
+        respond('error', 'Failed to open ZIP archive');
+    }
+    $zip->extractTo($tempDir);
     $zip->close();
-    unlink($tempFile);
-    $extractedFiles = scandir($tempDir);
-    ziplog("Extracted contents", $extractedFiles);
-} else {
-    ziplog("Failed to open ZIP file", ['error_code' => $zipResult]);
-    unlink($tempFile);
-    respond('error', 'Failed to open ZIP archive.');
-}
 
-// ---------------------------------------------------------------------
-// Process Extracted Backup Files
-// ---------------------------------------------------------------------
+    // Locate SQL dump file (if any)
+    // Now looking specifically for files like: database_backup_2025-02-02_18-48-17.sql
+    $sqlFiles = glob("$tempDir/database_backup_*.sql");
+    $sqlDumpPath = !empty($sqlFiles) ? $sqlFiles[0] : null;
 
-// 1. Update wp-config.php if present in the backup
-$extractedWpConfig = $tempDir . '/wp-config.php';
-if (file_exists($extractedWpConfig)) {
-    ziplog("Updating wp-config.php");
-    if (!copy($extractedWpConfig, $docRoot . '/wp-config.php')) {
-        ziplog("Failed to update wp-config.php", ['error' => error_get_last()]);
-        respond('error', 'Failed to update wp-config.php.');
+    // Handle wp-config.php
+    $wpConfig = "$docRoot/wp-config.php";
+    if (file_exists("$tempDir/wp-config.php")) {
+        // Backup existing wp-config if it exists
+        if (file_exists($wpConfig)) {
+            copy($wpConfig, $wpConfig . '.bak');
+        }
+        copy("$tempDir/wp-config.php", $wpConfig);
     }
-} else {
-    ziplog("wp-config.php not found in backup, skipping update.");
-}
-
-// 2. Update .htaccess if present in the backup
-$extractedHtaccess = $tempDir . '/.htaccess';
-if (file_exists($extractedHtaccess)) {
-    ziplog("Updating .htaccess");
-    if (!copy($extractedHtaccess, $docRoot . '/.htaccess')) {
-        ziplog("Failed to update .htaccess", ['error' => error_get_last()]);
-        respond('error', 'Failed to update .htaccess.');
+    if (!file_exists($wpConfig)) {
+        rrmdir($tempDir);
+        respond('error', 'wp-config.php not found');
     }
-} else {
-    ziplog(".htaccess not found in backup, skipping update.");
-}
 
-// 3. Process metadata.json if it exists (optional)
-$metadataFile = $tempDir . '/metadata.json';
-if (file_exists($metadataFile)) {
-    $metadataContents = file_get_contents($metadataFile);
-    $metadata = json_decode($metadataContents, true);
-    if (json_last_error() === JSON_ERROR_NONE) {
-        ziplog("Parsed metadata.json", $metadata);
-    } else {
-        ziplog("Failed to parse metadata.json", ['error' => json_last_error_msg()]);
+    // Extract and validate database credentials from wp-config.php
+    try {
+        $origCreds = extractDbCredentials($wpConfig);
+    } catch (Exception $e) {
+        rrmdir($tempDir);
+        respond('error', 'Failed to extract database credentials: ' . $e->getMessage());
     }
-} else {
-    ziplog("metadata.json not found in backup.");
-}
 
-// 4. Replace wp-content entirely if present in the backup
-$extractedWpContent = $tempDir . '/wp-content';
-$destinationWpContent = $docRoot . '/wp-content';
-if (is_dir($extractedWpContent)) {
-    ziplog("Replacing wp-content directory");
-    // Remove the existing wp-content folder if it exists
-    if (is_dir($destinationWpContent)) {
-        rrmdir($destinationWpContent);
-        ziplog("Existing wp-content removed");
+    // Get base (unprefixed) names from the original credentials.
+    $baseNames = getBaseDbNames($owner, $origCreds['DB_NAME'], $origCreds['DB_USER']);
+
+    // Update MySQL credentials using the new approach.
+    $updateResult = update_mysql_credentials(
+        $owner,
+        $origCreds['DB_NAME'],
+        $baseNames['baseDbName'],
+        $origCreds['DB_USER'],
+        $baseNames['baseDbUser'],
+        $origCreds['DB_PASSWORD']
+    );
+    if (!$updateResult['success']) {
+        rrmdir($tempDir);
+        respond('error', 'Database update failed: ' . $updateResult['message']);
     }
-    // Copy the backup wp-content to the destination
-    recursiveCopy($extractedWpContent, $destinationWpContent);
-    ziplog("wp-content directory replaced successfully");
-} else {
-    ziplog("wp-content directory not found in backup, skipping replacement.");
+    ziplog("Database update successful: " . $updateResult['message']);
+
+    // If an SQL dump is provided, attempt to import it using the mysql command-line.
+    if (!empty($sqlDumpPath) && file_exists($sqlDumpPath)) {
+        ziplog("Importing SQL dump using mysql command-line", ['sql_file' => $sqlDumpPath]);
+
+        // First set SQL mode to handle timestamp issues
+        $setModeCmd = sprintf(
+            "mysql -u%s -p%s -e '%s'",
+            escapeshellarg($updateResult['dbUser']),
+            escapeshellarg($updateResult['dbPassword']),
+            "SET GLOBAL sql_mode='NO_ENGINE_SUBSTITUTION,ALLOW_INVALID_DATES';"
+        );
+        exec($setModeCmd);
+
+        // Build the mysql command with modified SQL mode
+        $mysqlUser = escapeshellarg($updateResult['dbUser']);
+        $mysqlPassword = escapeshellarg($updateResult['dbPassword']);
+        $mysqlDb = escapeshellarg($updateResult['dbName']);
+        $sqlFile = escapeshellarg($sqlDumpPath);
+
+        // Import with modified SQL mode
+        $cmd = "mysql -u $mysqlUser -p$mysqlPassword $mysqlDb -e 'SET SESSION sql_mode=\"NO_ENGINE_SUBSTITUTION,ALLOW_INVALID_DATES\"; SOURCE $sqlFile;'";
+
+        // Log command (with password redacted)
+        ziplog("Executing SQL import command: " . preg_replace('/-p[^ ]+/', '-p[REDACTED]', $cmd));
+
+        exec($cmd, $output, $return_var);
+        ziplog("SQL import return code: $return_var", $output);
+
+        if ($return_var !== 0) {
+            ziplog("SQL Import failed", ['return_code' => $return_var, 'output' => $output]);
+            // Note: We continue even if import fails, as we want the rest of the restoration to proceed
+        } else {
+            ziplog("SQL dump imported successfully", ['database' => $updateResult['dbName']]);
+        }
+    }
+    // Update wp-config.php with new credentials
+    $newCreds = [
+        'DB_NAME'     => $updateResult['dbName'],
+        'DB_USER'     => $updateResult['dbUser'],
+        'DB_PASSWORD' => $updateResult['dbPassword'],
+        'DB_HOST'     => $origCreds['DB_HOST']
+    ];
+    updateWpConfig($wpConfig, $newCreds);
+    ziplog("wp-config.php updated with new credentials", [
+        'database' => $updateResult['dbName'],
+        'user'     => $updateResult['dbUser']
+    ]);
+
+    // Deploy wp-content directory: OVERWRITE current wp-content
+    if (is_dir("$tempDir/wp-content")) {
+        if (is_dir("$docRoot/wp-content")) {
+            // Remove the current wp-content directory entirely.
+            rrmdir("$docRoot/wp-content");
+        }
+        recursiveCopy("$tempDir/wp-content", "$docRoot/wp-content");
+        // Set proper permissions
+        $chmodCmd = "chmod -R 755 " . escapeshellarg("$docRoot/wp-content");
+        $chownCmd = "chown -R " . escapeshellarg("$owner:$owner") . " " . escapeshellarg("$docRoot/wp-content");
+        exec($chmodCmd);
+        exec($chownCmd);
+    }
+
+    // Cleanup temporary files
+    rrmdir($tempDir);
+
+    // Success response
+    respond('success', 'Deployment completed successfully', [
+        'path'     => $docRoot,
+        'database' => $updateResult['dbName'],
+        'backups_created' => [
+            'wp_config'  => file_exists($wpConfig . '.bak')
+        ]
+    ]);
+
+} catch (Exception $e) {
+    // Cleanup on error
+    if (isset($tempDir) && is_dir($tempDir)) {
+        rrmdir($tempDir);
+    }
+    http_response_code(500);
+    respond('error', 'Processing failed: ' . $e->getMessage());
 }
-
-// 5. Import the database dump (database_backup_*.sql)
-importDatabaseDump($tempDir, $docRoot);
-
-// 6. Set final file and directory permissions
-ziplog("Setting final permissions for document root");
-setOwnershipAndPermissions($docRoot, $owner);
-
-// 7. Clean up temporary extraction directory
-ziplog("Cleaning up temporary directory");
-rrmdir($tempDir);
-
-// Final success response
-ziplog("Backup process completed successfully");
-respond('success', 'Backup installed successfully.', ['destination' => $docRoot]);
-?>
 
 EOL
 
-# Create the main endpoint
-cat > $INSTALL_DIR/zipline-server.php << 'EOL'
+# Create the main endpoint (zipline-server.php)
+cat > "$INSTALL_DIR/zipline-server.php" << 'EOL'
 <?php
 /**
  * zipline-server.php
@@ -533,17 +658,18 @@ $response = [
 ];
 
 echo json_encode($response);
+?>
 EOL
 
-# Create systemd service file
-cat > /etc/systemd/system/$SERVICE_NAME.service << EOL
+# Create systemd service file with PHP configuration flags
+cat > /etc/systemd/system/"$SERVICE_NAME".service << EOL
 [Unit]
 Description=Zipline WHM Plugin Server
 After=network.target
 
 [Service]
 Type=simple
-ExecStart=/opt/cpanel/ea-php81/root/usr/bin/php -S 0.0.0.0:2000 $INSTALL_DIR/zipline-router.php
+ExecStart=/opt/cpanel/ea-php81/root/usr/bin/php -d upload_max_filesize=5G -d post_max_size=5G -d max_execution_time=600 -d max_input_time=600 -d memory_limit=512M -S 0.0.0.0:2000 $INSTALL_DIR/zipline-router.php
 WorkingDirectory=$INSTALL_DIR
 Restart=always
 User=root
@@ -554,16 +680,16 @@ WantedBy=multi-user.target
 EOL
 
 # Set proper permissions
-chmod 755 $INSTALL_DIR/*.php || handle_error "Failed to set permissions"
-chown -R root:root $INSTALL_DIR || handle_error "Failed to set ownership"
+chmod 755 "$INSTALL_DIR"/*.php || handle_error "Failed to set permissions"
+chown -R root:root "$INSTALL_DIR" || handle_error "Failed to set ownership"
 
 # Configure firewall
 configure_firewall
 
 # Reload systemd, enable and start the service
 systemctl daemon-reload || handle_error "Failed to reload systemd"
-systemctl enable $SERVICE_NAME || handle_error "Failed to enable service"
-systemctl restart $SERVICE_NAME || handle_error "Failed to start service"
+systemctl enable "$SERVICE_NAME" || handle_error "Failed to enable service"
+systemctl restart "$SERVICE_NAME" || handle_error "Failed to start service"
 
 echo "Zipline installation completed successfully!"
 echo "Server IP Addresses:"
@@ -575,8 +701,10 @@ done
 echo "To check the status, run: systemctl status $SERVICE_NAME"
 
 # Verify the service is running
-if systemctl is-active --quiet $SERVICE_NAME; then
+if systemctl is-active --quiet "$SERVICE_NAME"; then
     echo "Zipline service is running successfully"
 else
     handle_error "Zipline service failed to start"
 fi
+
+# End of installer.sh
